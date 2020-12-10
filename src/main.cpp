@@ -33,12 +33,15 @@ typedef struct struct_message {
     uint8_t ledCount; // led count
     unsigned long millis; // time message was sent
     CRGB leds[NUM_LEDS];
+    unsigned long localTime; // time the pixel was clocked in
 } struct_message;
 
 enum response_types{ACK_PACKET, PLAYED_FRAME};
 typedef struct struct_response {
   response_types responseType;
   unsigned long playedFrameMillis;
+  unsigned long localTimeIn;
+  unsigned long localTimePlayed;
 } struct_response;
 
 // Create a struct_message called myData
@@ -91,12 +94,18 @@ void setupWifi() {
   Udp.begin(localUdpPort);
 }
 
-void sendResponse(response_types type, u_long frameTime) {
+void sendResponse(response_types type, struct_message* frame) {
   // let the sender know we just played the frame
-  Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
   struct_response resp;
   resp.responseType = type;
-  resp.playedFrameMillis = frameTime;
+  resp.playedFrameMillis = frame->millis;
+  resp.localTimeIn = frame->localTime;
+  if (type == PLAYED_FRAME) {
+    resp.localTimePlayed = millis();
+  } else {
+    resp.localTimePlayed = 0;
+  }
+  Udp.beginPacket(Udp.remoteIP(), localUdpPort + 1);
   Udp.write((char *)&resp, sizeof(resp));
   Udp.endPacket();
 }
@@ -191,14 +200,15 @@ void loop() {
   {
     // receive incoming UDP packets
     // Serial.printf("Received %d bytes from %s, port %d\n", packetSize, Udp.remoteIP().toString().c_str(), Udp.remotePort());
-    int len = Udp.read((char *)&incomingPacket, sizeof(incomingPacket));
+    int len = Udp.read((char *)&incomingPacket, sizeof(incomingPacket) - sizeof(unsigned long));
     if (len > 0)
     {
       if (buffer.isFull()) {
         buffer.shift(); // remove an item from start
         overflow++;
       }
-      sendResponse(ACK_PACKET, incomingPacket.millis);
+      incomingPacket.localTime = millis(); // store localtime at end of packet
+      sendResponse(ACK_PACKET, &incomingPacket);
       buffer.push(incomingPacket);
       // enable playback when buffer is 1/2 full
       if (!playing && (buffer.size() >= MAX_BUFFER)) {
@@ -229,7 +239,7 @@ void loop() {
           nextFramePlayTime = buffer.first().millis - thisFrame.millis + millis();
         }
         // Serial.printf("First %d, this %d,  local %d\n", buffer.first().millis, thisFrame.millis, millis());
-        sendResponse(PLAYED_FRAME, thisFrame.millis);
+        sendResponse(PLAYED_FRAME, &thisFrame);
         FastLED.show();
         framesPlayed++;
       }
