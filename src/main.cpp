@@ -16,12 +16,13 @@
 #include <FastLED.h>
 #include <CircularBuffer.h>
 
-#define NUM_LEDS 39 * 2
+#ifndef NUM_LEDS
+#define NUM_LEDS 33 * 2
+#endif
+
 #define LED_TYPE WS2812
 #define COLOR_ORDER GRB
 #define DATA_PIN LED_BUILTIN
-#define MILLI_AMPS 200 // IMPORTANT: set the max milli-Amps of your power supply (4A = 4000mA)
-#define FRAMES_PER_SECOND 120
 #define BUFFER_SIZE 25
 #define MAX_BUFFER 12 // 8 // start playing at 4 frames
 
@@ -30,6 +31,7 @@
 // 39 * 2 * 3 bytes each = 234bytes
 typedef struct struct_message {
     uint8_t brightness; // brightness to use
+    uint8_t maxPower;
     uint8_t ledCount; // led count
     unsigned long millis; // time message was sent
     CRGB leds[NUM_LEDS];
@@ -116,7 +118,7 @@ void setup() {
   
   // setup fastled
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
-  FastLED.setMaxPowerInVoltsAndMilliamps(5, MILLI_AMPS);
+  FastLED.setMaxPowerInVoltsAndMilliamps(5, 100); // set low till get get some real data
   // set master brightness control this will be updated every cycle
   FastLED.setBrightness(10); // ignore my struct until we get data in there
   FastLED.showColor(CRGB::Black);
@@ -235,6 +237,7 @@ void loop() {
         struct_message thisFrame = buffer.shift();
         memcpy(leds, thisFrame.leds, sizeof(thisFrame.leds));
         FastLED.setBrightness(thisFrame.brightness);
+        FastLED.setMaxPowerInVoltsAndMilliamps(5, thisFrame.maxPower);
         if (!buffer.isEmpty()) {
           nextFramePlayTime = buffer.first().millis - thisFrame.millis + millis();
         }
