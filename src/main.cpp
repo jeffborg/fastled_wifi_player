@@ -22,22 +22,29 @@
 
 #define LED_TYPE WS2812
 #define COLOR_ORDER GRB
-#define DATA_PIN LED_BUILTIN
+#define DATA_PIN 15
 #define BUFFER_SIZE 25
 #define MAX_BUFFER 12 // 8 // start playing at 4 frames
+#define MAX_TOTAL_POWER 2750
+#define MCU_POWER 250
+
+// #define FEEDBACK - send udp packets back
 
 // Structure example to receive data
 // Must match the sender structure
 // 39 * 2 * 3 bytes each = 234bytes
 typedef struct struct_message {
     uint8_t brightness; // brightness to use
-    uint8_t maxPower;
+    uint8_t maxPower; // max power consumption 1/20th scale (multiple by 20) for milliamps
     uint8_t ledCount; // led count
     unsigned long millis; // time message was sent
     CRGB leds[NUM_LEDS];
-    unsigned long localTime; // time the pixel was clocked in
+    unsigned long localTime; // time the pixel was clocked in - we use this in this sketch this isn't transmitted in the packet
 } struct_message;
 
+#define TIME_SYNC_UDP_SERVER 124
+
+#ifdef FEEDBACK
 enum response_types{ACK_PACKET, PLAYED_FRAME};
 typedef struct struct_response {
   response_types responseType;
@@ -45,6 +52,7 @@ typedef struct struct_response {
   unsigned long localTimeIn;
   unsigned long localTimePlayed;
 } struct_response;
+#endif
 
 // Create a struct_message called myData
 // struct_message myData;
@@ -75,6 +83,7 @@ struct_message incomingPacket;
 
 uint16 counter = 0;
 WiFiUDP Udp;
+WiFiUDP TimeUdp;
 unsigned int localUdpPort = 4210;  // local port to listen on
 
 // Callback function that will be executed when data is received
@@ -83,6 +92,59 @@ unsigned int localUdpPort = 4210;  // local port to listen on
 //   FastLED.setBrightness(myData.brightness);
 //   counter++;
 // }
+
+// time a sync packet was sent off
+unsigned long timeSyncStarted = 0;
+// time difference between our clock and the remote clock
+// note this is signed can be -ve
+long timeDifference = 0;
+
+// send time packet off
+void sendTimePacket() {
+  TimeUdp.beginPacket(IPAddress(192,168,4,1), TIME_SYNC_UDP_SERVER);
+  unsigned long time = 0;
+  TimeUdp.write((uint8_t *)&time, sizeof(time)); // send 8 byte packet to keep rtt about equal as much as possible
+  timeSyncStarted = millis();
+  TimeUdp.endPacket();
+}
+
+// for main loop process time response without delaying loop
+boolean processTimeResponseNoDelay() {
+  int cb = TimeUdp.parsePacket();
+  if (cb != 0) {
+    unsigned long ourTime = millis();
+    unsigned long halfSyncDelay = (ourTime - timeSyncStarted) / 2;
+    // buffer to stuff server time into
+    unsigned long serverTime = 0;
+    TimeUdp.read((char *)&serverTime, sizeof(serverTime));
+    // write out new time difference to global variable
+    timeDifference = (serverTime + halfSyncDelay) - ourTime;
+    return true;
+  }
+  return false;
+}
+
+// process time response packet
+boolean processTimeResponse(uint8_t timeout = 30) {
+  if (timeSyncStarted == 0) {
+    return false;
+  }
+  do {
+    if (timeout == 0) {
+      timeSyncStarted = 0; // reset start time
+      return false; // timeout after 30ms
+    }
+    delay(1);
+    timeout--;
+  } while (!processTimeResponseNoDelay());
+  return true;
+}
+
+// return the time off the remote end
+unsigned long serverMillis() {
+  return millis() + timeDifference;
+}
+
 
 void setupWifi() {
   WiFi.begin("ESP32-80c4a24");
@@ -93,9 +155,18 @@ void setupWifi() {
     Serial.print(".");
   }
   Serial.println(" connected");
+  // sync time
+  // TIME_SYNC_UDP_SERVER
+  TimeUdp.begin(TIME_SYNC_UDP_SERVER);
+  Serial.println("syncing time first");
+  sendTimePacket();
+  processTimeResponse();
+  Serial.print("time difference is ");
+  Serial.println(timeDifference);
   Udp.begin(localUdpPort);
 }
 
+#ifdef FEEDBACK
 void sendResponse(response_types type, struct_message* frame) {
   // let the sender know we just played the frame
   struct_response resp;
@@ -111,6 +182,7 @@ void sendResponse(response_types type, struct_message* frame) {
   Udp.write((char *)&resp, sizeof(resp));
   Udp.endPacket();
 }
+#endif
  
 void setup() {
   // Initialize Serial Monitor
@@ -118,6 +190,8 @@ void setup() {
   
   // setup fastled
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  pinMode(LED_BUILTIN, OUTPUT);
+  set_max_power_indicator_LED(LED_BUILTIN);
   FastLED.setMaxPowerInVoltsAndMilliamps(5, 100); // set low till get get some real data
   // set master brightness control this will be updated every cycle
   FastLED.setBrightness(10); // ignore my struct until we get data in there
@@ -158,21 +232,8 @@ void loop() {
   }
 
   EVERY_N_MILLISECONDS(1000) {
-    Serial.print("Counter: ");
-    Serial.println(counter);
-    Serial.print("Frames Played: ");
-    Serial.println(framesPlayed);
-    Serial.print("Itmes in buffer: ");
-    Serial.println(buffer.size());
-    Serial.print("Starved: ");
-    Serial.println(starved);
-    Serial.print("Overflow: ");
-    Serial.println(overflow);
-    Serial.print("maxBufferItems: ");
-    Serial.println(maxBufferItems);
-    Serial.print("minBufferItems: ");
-    Serial.println(minBufferItems);
-
+    Serial.printf("Counter: %d, Frames Played: %d, Items in buffer: %d, Starved: %d, overflows: %d, maxItems: %d, minItems: %d\n", 
+                    counter,    framesPlayed,      buffer.size(),       starved,      overflow,     maxBufferItems, minBufferItems);
     // Serial.print("last Frame time: ");
     // Serial.println(lastFrameTimeMillis);
     // Serial.print("last lcoal time: ");
@@ -210,7 +271,9 @@ void loop() {
         overflow++;
       }
       incomingPacket.localTime = millis(); // store localtime at end of packet
+      #ifdef FEEDBACK
       sendResponse(ACK_PACKET, &incomingPacket);
+      #endif
       buffer.push(incomingPacket);
       // enable playback when buffer is 1/2 full
       if (!playing && (buffer.size() >= MAX_BUFFER)) {
@@ -237,12 +300,15 @@ void loop() {
         struct_message thisFrame = buffer.shift();
         memcpy(leds, thisFrame.leds, sizeof(thisFrame.leds));
         FastLED.setBrightness(thisFrame.brightness);
-        FastLED.setMaxPowerInVoltsAndMilliamps(5, thisFrame.maxPower);
+
+        FastLED.setMaxPowerInVoltsAndMilliamps(5, (thisFrame.maxPower * 20) < MAX_TOTAL_POWER - MCU_POWER ? (thisFrame.maxPower * 20) : MAX_TOTAL_POWER - MCU_POWER);
         if (!buffer.isEmpty()) {
           nextFramePlayTime = buffer.first().millis - thisFrame.millis + millis();
         }
         // Serial.printf("First %d, this %d,  local %d\n", buffer.first().millis, thisFrame.millis, millis());
+        #ifdef FEEDBACK
         sendResponse(PLAYED_FRAME, &thisFrame);
+        #endif
         FastLED.show();
         framesPlayed++;
       }
