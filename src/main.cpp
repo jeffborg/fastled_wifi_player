@@ -22,13 +22,17 @@
 
 #define LED_TYPE WS2812
 #define COLOR_ORDER GRB
-#define DATA_PIN 15
-#define BUFFER_SIZE 25
-#define MAX_BUFFER 12 // 8 // start playing at 4 frames
+#define DATA_PIN D1
+
+// from main sketch
+// #define FRAMES_PER_SECOND 120
+// this is what the main sketch is delaying frames by
+// #define BUFFER_DELAY 150
+// we need at least buffer delay space
+#define BUFFER_SIZE 30
+
 #define MAX_TOTAL_POWER 2750
 #define MCU_POWER 250
-
-// #define FEEDBACK - send udp packets back
 
 // Structure example to receive data
 // Must match the sender structure
@@ -39,20 +43,9 @@ typedef struct struct_message {
     uint8_t ledCount; // led count
     unsigned long millis; // time message was sent
     CRGB leds[NUM_LEDS];
-    unsigned long localTime; // time the pixel was clocked in - we use this in this sketch this isn't transmitted in the packet
 } struct_message;
 
 #define TIME_SYNC_UDP_SERVER 124
-
-#ifdef FEEDBACK
-enum response_types{ACK_PACKET, PLAYED_FRAME};
-typedef struct struct_response {
-  response_types responseType;
-  unsigned long playedFrameMillis;
-  unsigned long localTimeIn;
-  unsigned long localTimePlayed;
-} struct_response;
-#endif
 
 // Create a struct_message called myData
 // struct_message myData;
@@ -113,7 +106,7 @@ boolean processTimeResponseNoDelay() {
   int cb = TimeUdp.parsePacket();
   if (cb != 0) {
     unsigned long ourTime = millis();
-    unsigned long halfSyncDelay = (ourTime - timeSyncStarted) / 2;
+    unsigned long halfSyncDelay = ((ourTime - timeSyncStarted) / 2) + 2; // 2 ms fudge factor
     // buffer to stuff server time into
     unsigned long serverTime = 0;
     TimeUdp.read((char *)&serverTime, sizeof(serverTime));
@@ -147,7 +140,7 @@ unsigned long serverMillis() {
 
 
 void setupWifi() {
-  WiFi.begin("ESP32-80c4a24");
+  WiFi.begin(WIFI_NAME);
 
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -160,30 +153,12 @@ void setupWifi() {
   TimeUdp.begin(TIME_SYNC_UDP_SERVER);
   Serial.println("syncing time first");
   sendTimePacket();
-  processTimeResponse();
+  processTimeResponse(100);
   Serial.print("time difference is ");
   Serial.println(timeDifference);
   Udp.begin(localUdpPort);
 }
 
-#ifdef FEEDBACK
-void sendResponse(response_types type, struct_message* frame) {
-  // let the sender know we just played the frame
-  struct_response resp;
-  resp.responseType = type;
-  resp.playedFrameMillis = frame->millis;
-  resp.localTimeIn = frame->localTime;
-  if (type == PLAYED_FRAME) {
-    resp.localTimePlayed = millis();
-  } else {
-    resp.localTimePlayed = 0;
-  }
-  Udp.beginPacket(Udp.remoteIP(), localUdpPort + 1);
-  Udp.write((char *)&resp, sizeof(resp));
-  Udp.endPacket();
-}
-#endif
- 
 void setup() {
   // Initialize Serial Monitor
   Serial.begin(115200);
@@ -214,8 +189,6 @@ void setup() {
   // esp_now_register_recv_cb(OnDataRecv);
 }
 
-bool playing = false; // is there enough buffer
-unsigned long nextFramePlayTime = 0;
 uint16_t framesPlayed = 0;
 uint16_t starved = 0;
 uint16_t overflow = 0;
@@ -224,7 +197,7 @@ uint8_t minBufferItems = BUFFER_SIZE;
 
 void loop() {
 
-  // check wifi
+  // check wifi reconnect if disconnected
   EVERY_N_MILLIS(20) {
     if (WiFi.status() != WL_CONNECTED) {
       setupWifi();
@@ -248,14 +221,8 @@ void loop() {
     framesPlayed = 0;
     starved = 0;
     overflow = 0;
-    // minBufferItems = BUFFER_SIZE;
-    // maxBufferItems = 0;
-  }
-  if (playing)  {
-    minBufferItems = MIN(buffer.size(), minBufferItems);
-    if (buffer.size() > maxBufferItems) {
-      maxBufferItems = buffer.size();
-    }
+    minBufferItems = BUFFER_SIZE;
+    maxBufferItems = 0;
   }
 
   int packetSize = Udp.parsePacket();
@@ -263,60 +230,41 @@ void loop() {
   {
     // receive incoming UDP packets
     // Serial.printf("Received %d bytes from %s, port %d\n", packetSize, Udp.remoteIP().toString().c_str(), Udp.remotePort());
-    int len = Udp.read((char *)&incomingPacket, sizeof(incomingPacket) - sizeof(unsigned long));
+    int len = Udp.read((char *)&incomingPacket, sizeof(incomingPacket));
     if (len > 0)
     {
-      if (buffer.isFull()) {
-        buffer.shift(); // remove an item from start
+      if (!buffer.isFull()) {
+        // check if clock hasn't gone backwards
+        // if (buffer.size() > 0 && incomingPacket.millis < buffer.last().millis) {
+        //   // update clock
+        //   sendTimePacket();
+        //   processTimeResponse();
+        // }
+        buffer.push(incomingPacket);
+      } else {
         overflow++;
       }
-      incomingPacket.localTime = millis(); // store localtime at end of packet
-      #ifdef FEEDBACK
-      sendResponse(ACK_PACKET, &incomingPacket);
-      #endif
-      buffer.push(incomingPacket);
-      // enable playback when buffer is 1/2 full
-      if (!playing && (buffer.size() >= MAX_BUFFER)) {
-        Serial.println("staring playback");
-        nextFramePlayTime = 0;
-        playing = true;
+      if (buffer.size() > maxBufferItems) {
+        maxBufferItems = buffer.size();
       }
       counter++;
     }
   }
-  if (playing) {
-    if (!buffer.isEmpty()) { // at last 2 items in buffer
-      // long frameDelay = buffer.first().millis - lastFrameTimeMillis;
-      // if (frameDelay < 0) {
-      //   Serial.println("frame delay was negative");
-      //   Serial.println(frameDelay);
-      //   frameDelay = 0;
-      // }
-      // EVERY_N_MILLISECONDS(200) {
-      //   Serial.printf("%d > %d\n", nextFramePlayTime, millis());
-      // }
-      if (nextFramePlayTime <= millis()) // (lastLocalTimeMillis + frameDelay) > (millis() + frameDelay)) // if beyond current time play the frame
-      {
-        struct_message thisFrame = buffer.shift();
-        memcpy(leds, thisFrame.leds, sizeof(thisFrame.leds));
-        FastLED.setBrightness(thisFrame.brightness);
 
-        FastLED.setMaxPowerInVoltsAndMilliamps(5, (thisFrame.maxPower * 20) < MAX_TOTAL_POWER - MCU_POWER ? (thisFrame.maxPower * 20) : MAX_TOTAL_POWER - MCU_POWER);
-        if (!buffer.isEmpty()) {
-          nextFramePlayTime = buffer.first().millis - thisFrame.millis + millis();
-        }
-        // Serial.printf("First %d, this %d,  local %d\n", buffer.first().millis, thisFrame.millis, millis());
-        #ifdef FEEDBACK
-        sendResponse(PLAYED_FRAME, &thisFrame);
-        #endif
-        FastLED.show();
-        framesPlayed++;
-      }
-    } else {
-      starved++;
-      playing = false; // wait to fill up again
-      Serial.println("starved!");
+  if (!buffer.isEmpty()) { // at least 1 item in buffer
+    if (buffer.first().millis < serverMillis()) {
+      // frame scheduled for playback
+      struct_message thisFrame = buffer.shift();
+      memcpy(leds, thisFrame.leds, sizeof(thisFrame.leds));
+      FastLED.setBrightness(thisFrame.brightness);
+      FastLED.setMaxPowerInVoltsAndMilliamps(5, (thisFrame.maxPower * 20) < MAX_TOTAL_POWER - MCU_POWER ? (thisFrame.maxPower * 20) : MAX_TOTAL_POWER - MCU_POWER);
+      FastLED.show();
+      minBufferItems = MIN(buffer.size(), minBufferItems);
+      framesPlayed++;
     }
+  } else {
+    starved++;
+    // Serial.println("starved!");
   }
 }
 
